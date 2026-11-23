@@ -9,20 +9,25 @@
 - data_archive ← batch_store
 - crawl_cost ← proxy_pool
 - crawl_job → scheduler
+- url_dedup 指纹 v1→v2 迁移 → crawl_job 清单同步 → scheduler 选址 → 回滚重放
 """
 from __future__ import annotations
 
+import hashlib
 import random
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
-    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
-    SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    DeliveryTask, DiffRecord, ExecutionConfirmation, ExtractRule,
+    FingerprintCompatReceipt, FingerprintRegistry, IncrCursor, ParseLogEntry,
+    ProxyNode, QualitySample, RawExtractedContent, ResolvedEntry, SampleMethod,
+    SchedulePlan, SiteConfig, SiteParamPolicy, SiteType, StorageBatch,
+    UrlFingerprint,
 )
 from app.store import store
 
@@ -485,6 +490,226 @@ def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
     )
     _persist_schedule(plan)
     return plan
+
+
+# ---------------------------------------------------------------------------
+# 流水线 9: url_dedup 指纹 v1→v2 迁移 → crawl_job 清单同步 → scheduler 选址
+# ---------------------------------------------------------------------------
+
+# 转换原因：无法核实来源或缺原始网址的记录只做恒等转换，原因随回执保留。
+REASON_CONVERTED = "已按站点参数语义转换"
+REASON_SOURCE_NOT_READY = "来源未登记v2策略，按旧键恒等转换"
+REASON_MISSING_URL = "缺原始网址，无法重算，保留旧键"
+
+# 默认注册表：与 store 同生命周期的进程级单例，测试可自建实例隔离。
+fingerprint_registry = FingerprintRegistry()
+
+
+def migrate_fingerprint_registry(
+    legacy_rows: list[dict[str, Any]],
+    policies: dict[str, SiteParamPolicy],
+    ready_sources: set[str],
+    registry: FingerprintRegistry,
+) -> list[FingerprintCompatReceipt]:
+    """把历史采集指纹迁移到支持站点参数语义的 v2 版本。
+
+    每条旧记录签发一张指纹兼容回执，同次上线期间新旧消费者都凭回执
+    互相承认对方登记的指纹：
+
+    - 存量字段（旧 URL、旧摘要、重复次数）全部保留在回执上；
+    - 来源未就绪或缺原始网址的记录只做恒等转换，并保留转换原因；
+    - 重复导入同来源同旧键的记录不新增回执（幂等），次数取累计较大值。
+
+    返回本次新签发的回执列表。
+    """
+    issued: list[FingerprintCompatReceipt] = []
+    for row in legacy_rows:
+        fp = UrlFingerprint.from_seed_row(row)
+        legacy_hash = fp.hash_value or (
+            UrlFingerprint.compute_v1_hash(fp.source_url) if fp.source_url else ""
+        )
+        if not legacy_hash:
+            continue  # 既无旧摘要又无原始网址，无法锚定旧键
+        key = (fp.discovery_channel, legacy_hash)
+        existing = registry.receipts.get(key)
+        if existing is not None:
+            # 重复导入：沿用已确认回执，次数取累计较大值
+            existing.duplicate_count = max(existing.duplicate_count, fp.duplicate_count)
+            continue
+        receipt = _convert_fingerprint(fp, legacy_hash, policies, ready_sources)
+        registry.receipts[key] = receipt
+        issued.append(receipt)
+    return issued
+
+
+def _convert_fingerprint(
+    fp: UrlFingerprint,
+    legacy_hash: str,
+    policies: dict[str, SiteParamPolicy],
+    ready_sources: set[str],
+) -> FingerprintCompatReceipt:
+    """单条旧指纹转换：来源就绪且有原始网址才按 v2 重算，否则恒等。"""
+    domain = urlparse(fp.source_url).netloc if fp.source_url else ""
+    receipt_id = "RCPT-" + hashlib.sha256(
+        f"{fp.discovery_channel}|{legacy_hash}".encode()).hexdigest()[:12]
+    base: dict[str, Any] = dict(
+        receipt_id=receipt_id,
+        source_channel=fp.discovery_channel,
+        site_domain=domain,
+        legacy_url=fp.source_url,
+        legacy_hash=legacy_hash,
+        duplicate_count=fp.duplicate_count,
+    )
+    if not fp.source_url:
+        # 缺原始网址：无法重算，恒等转换并保留原因
+        return FingerprintCompatReceipt(
+            **base, v2_hash=legacy_hash, rule_version="v1",
+            conversion_reason=REASON_MISSING_URL)
+    if fp.discovery_channel not in ready_sources:
+        # 来源未就绪：无法核实来源参数语义，恒等转换并保留原因
+        return FingerprintCompatReceipt(
+            **base, v2_hash=legacy_hash, rule_version="v1",
+            conversion_reason=REASON_SOURCE_NOT_READY)
+    policy = policies.get(domain)
+    return FingerprintCompatReceipt(
+        **base,
+        v2_hash=UrlFingerprint.compute_v2_hash(fp.source_url, policy),
+        rule_version="v2",
+        conversion_reason=REASON_CONVERTED)
+
+
+def resolve_entry_address(
+    url: str,
+    source_channel: str,
+    registry: FingerprintRegistry,
+    policies: dict[str, SiteParamPolicy],
+    ready_sources: set[str],
+    consumer_version: str | None = None,
+) -> ResolvedEntry | None:
+    """把单个入口地址解析为消费者规则版本下的可执行地址。
+
+    已登记回执的按回执取等价键；未登记的按来源就绪状态即时归一化。
+    恒等回执（未就绪来源/缺原始网址）在任何版本下都只认旧键。
+    返回 None 表示该地址无法锚定旧键（空 URL）。
+    """
+    if not url:
+        return None
+    version = consumer_version or registry.active_rule_version
+    legacy_hash = UrlFingerprint.compute_v1_hash(url)
+    receipt = registry.receipt_for(source_channel, legacy_hash)
+    if receipt is not None:
+        if version == "v2" and not receipt.is_identity:
+            canonical, used_version = receipt.v2_hash, "v2"
+        else:
+            canonical, used_version = receipt.legacy_hash, "v1"
+        return ResolvedEntry(
+            input_url=url, source_channel=source_channel,
+            legacy_hash=legacy_hash, canonical_key=canonical,
+            executable_address=receipt.legacy_url or url,
+            rule_version=used_version, receipt_id=receipt.receipt_id,
+            conversion_reason=receipt.conversion_reason)
+    if version == "v2" and source_channel in ready_sources:
+        policy = policies.get(urlparse(url).netloc)
+        return ResolvedEntry(
+            input_url=url, source_channel=source_channel,
+            legacy_hash=legacy_hash,
+            canonical_key=UrlFingerprint.compute_v2_hash(url, policy),
+            executable_address=url, rule_version="v2")
+    return ResolvedEntry(
+        input_url=url, source_channel=source_channel,
+        legacy_hash=legacy_hash, canonical_key=legacy_hash,
+        executable_address=url, rule_version="v1")
+
+
+def select_executable_addresses(
+    entries: list[tuple[str, str]],
+    registry: FingerprintRegistry,
+    policies: dict[str, SiteParamPolicy],
+    ready_sources: set[str],
+    consumer_version: str | None = None,
+) -> list[ResolvedEntry]:
+    """调度选址：按消费者规则版本的等价键去重，每组取首个为实际执行地址。
+
+    业务等价范围随版本与来源就绪状态不同而不同：v2 合并仅跟踪参数不同
+    的地址，但未就绪来源的记录仍按旧键恒等，不与已就绪记录合并；
+    v1 维持旧摘要等价，供已有采集作业继续使用。
+    """
+    selected: dict[str, ResolvedEntry] = {}
+    for url, source_channel in entries:
+        resolved = resolve_entry_address(
+            url, source_channel, registry, policies, ready_sources, consumer_version)
+        if resolved is None:
+            continue
+        if resolved.canonical_key not in selected:
+            selected[resolved.canonical_key] = resolved
+    return list(selected.values())
+
+
+def confirm_execution(resolved: ResolvedEntry,
+                      registry: FingerprintRegistry) -> ExecutionConfirmation:
+    """确认一次执行机会：同来源同旧键只确认一次。
+
+    重复导入与回滚重放都命中先前确认凭证，只累加重放次数，不新增执行。
+    """
+    key = (resolved.source_channel, resolved.legacy_hash)
+    existing = registry.confirmations.get(key)
+    if existing is not None:
+        existing.replay_count += 1
+        return existing
+    confirmation = ExecutionConfirmation(
+        confirmation_id="CONF-" + hashlib.sha256(
+            f"{resolved.source_channel}|{resolved.legacy_hash}".encode()).hexdigest()[:12],
+        receipt_id=resolved.receipt_id,
+        source_channel=resolved.source_channel,
+        legacy_hash=resolved.legacy_hash,
+        canonical_key=resolved.canonical_key,
+        rule_version=resolved.rule_version,
+        executable_address=resolved.executable_address,
+    )
+    registry.confirmations[key] = confirmation
+    return confirmation
+
+
+def sync_conversion_to_job_list(
+    job_rows: list[dict[str, Any]],
+    registry: FingerprintRegistry,
+    policies: dict[str, SiteParamPolicy],
+    ready_sources: set[str],
+    source_channel: str = "crawl_job",
+    consumer_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """把指纹转换结果同步到采集任务清单。
+
+    每个作业行回写「可执行地址 / 规则版本 / 指纹旧键」：调度随后按兼容
+    回执选择可执行地址，回滚时凭旧键沿用先前确认凭证。
+    """
+    version = consumer_version or registry.active_rule_version
+    for row in job_rows:
+        raw = str(row.get("入口URL", ""))
+        urls = [u.strip() for u in raw.split(",") if u.strip()]
+        selected = select_executable_addresses(
+            [(u, source_channel) for u in urls],
+            registry, policies, ready_sources, consumer_version)
+        row["可执行地址"] = ",".join(s.executable_address for s in selected)
+        row["规则版本"] = version
+        row["指纹旧键"] = ",".join(s.legacy_hash[:12] for s in selected)
+    return job_rows
+
+
+def rollback_fingerprint_registry(registry: FingerprintRegistry) -> dict[str, Any]:
+    """数据环境回滚：恢复旧键消费，回执标记已回滚，确认凭证全部保留。
+
+    回滚后重放任一已确认申请都会命中先前确认凭证，不增加重复执行。
+    """
+    registry.active_rule_version = "v1"
+    registry.rolled_back = True
+    for receipt in registry.receipts.values():
+        receipt.status = "已回滚"
+    return {
+        "active_rule_version": registry.active_rule_version,
+        "receipts_rolled_back": len(registry.receipts),
+        "confirmations_kept": len(registry.confirmations),
+    }
 
 
 # ---------------------------------------------------------------------------

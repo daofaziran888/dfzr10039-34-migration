@@ -179,13 +179,41 @@ class UrlFingerprint:
     status: str = "已记录"
 
     @classmethod
-    def compute(cls, url: str, algorithm: str = "sha256") -> UrlFingerprint:
+    def compute_v1_hash(cls, url: str, algorithm: str = "sha256") -> str:
+        """v1 指纹：通用参数排序，不区分参数语义（采集任务入口现状）。"""
         parsed = urlparse(url)
         normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         params = "&".join(sorted(parsed.query.split("&"))) if parsed.query else ""
         if params:
             normalized += f"?{params}"
-        h = hashlib.new(algorithm, normalized.encode()).hexdigest()
+        return hashlib.new(algorithm, normalized.encode()).hexdigest()
+
+    @classmethod
+    def compute_v2_hash(cls, url: str, policy: SiteParamPolicy | None = None,
+                        algorithm: str = "sha256") -> str:
+        """v2 指纹：按站点参数语义剔除跟踪参数，功能参数保留并排序。
+
+        未登记语义的参数一律按功能参数保留（保守策略），保证新规则
+        不误合并功能参数值不同的地址；无站点策略时退化为 v1 通用排序。
+        """
+        parsed = urlparse(url)
+        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            kept: list[str] = []
+            for pair in parsed.query.split("&"):
+                if not pair:
+                    continue
+                name = pair.split("=", 1)[0]
+                if policy is not None and policy.is_tracking(name):
+                    continue  # 跟踪参数不参与业务等价
+                kept.append(pair)
+            if kept:
+                normalized += f"?{'&'.join(sorted(kept))}"
+        return hashlib.new(algorithm, normalized.encode()).hexdigest()
+
+    @classmethod
+    def compute(cls, url: str, algorithm: str = "sha256") -> UrlFingerprint:
+        h = cls.compute_v1_hash(url, algorithm)
         return cls(
             fingerprint_id=f"FP-{h[:12]}",
             source_url=url,
@@ -211,6 +239,117 @@ class UrlFingerprint:
             duplicate_count=dup,
             status=str(row.get("status", "已记录")),
         )
+
+
+# ---------------------------------------------------------------------------
+# 指纹 v1→v2 迁移：站点参数语义、兼容回执、执行确认凭证
+# ---------------------------------------------------------------------------
+
+class ParamRole(str, Enum):
+    FUNCTIONAL = "功能参数"
+    TRACKING = "跟踪参数"
+
+
+@dataclass(frozen=True)
+class SiteParamPolicy:
+    """站点参数语义策略：v2 指纹按站点区分功能参数与跟踪参数。
+
+    未登记的参数一律按功能参数保留（保守策略），保证新规则不误合并
+    功能参数值不同的地址。
+    """
+    site_domain: str
+    functional_params: tuple[str, ...] = ()
+    tracking_params: tuple[str, ...] = ()
+
+    def role_of(self, param_name: str) -> ParamRole:
+        if param_name in self.tracking_params:
+            return ParamRole.TRACKING
+        return ParamRole.FUNCTIONAL
+
+    def is_tracking(self, param_name: str) -> bool:
+        return self.role_of(param_name) == ParamRole.TRACKING
+
+
+@dataclass
+class FingerprintCompatReceipt:
+    """指纹兼容回执：同次上线期间新旧消费者据此互相承认对方登记的指纹。
+
+    存量字段（旧 URL、旧摘要、重复次数）一律保留；无法核实来源或缺原始
+    网址的记录只做恒等转换（v2_hash == legacy_hash），转换原因随回执保留。
+    """
+    receipt_id: str
+    source_channel: str
+    site_domain: str
+    legacy_url: str
+    legacy_hash: str
+    v2_hash: str
+    duplicate_count: int = 0
+    rule_version: str = "v1"        # 转换时实际使用的规则版本
+    conversion_reason: str = ""     # 恒等转换的原因；正常转换为已按站点参数语义转换
+    status: str = "已确认"           # 已确认 / 已回滚
+
+    @property
+    def is_identity(self) -> bool:
+        """恒等转换的回执只认旧键，不参与 v2 等价合并。"""
+        return self.v2_hash == self.legacy_hash
+
+    def canonical_key(self, rule_version: str) -> str:
+        """按消费者规则版本给出业务等价键。"""
+        return self.v2_hash if rule_version == "v2" else self.legacy_hash
+
+
+@dataclass
+class ExecutionConfirmation:
+    """执行确认凭证：同一来源同一旧键只确认一个执行机会。
+
+    重复导入与回滚重放都沿用该凭证，不新增执行；replay_count 只记录重放次数。
+    凭证上保留实际使用的规则版本和对应旧键，回滚后可凭旧键命中。
+    """
+    confirmation_id: str
+    receipt_id: str
+    source_channel: str
+    legacy_hash: str
+    canonical_key: str
+    rule_version: str
+    executable_address: str
+    confirmed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    replay_count: int = 0
+
+
+@dataclass
+class ResolvedEntry:
+    """调度解析结果：一个入口地址在某规则版本下的归一化结论。"""
+    input_url: str
+    source_channel: str
+    legacy_hash: str
+    canonical_key: str        # 当前规则版本下的业务等价键
+    executable_address: str   # 调度实际选的地址
+    rule_version: str         # 实际使用的规则版本
+    receipt_id: str = ""
+    conversion_reason: str = ""
+
+
+@dataclass
+class FingerprintRegistry:
+    """指纹迁移注册表：兼容回执与执行确认凭证的登记、查询与回滚。
+
+    回执与确认都以 (来源, 旧键) 去重：重复导入不新增回执，
+    回滚后重放不新增执行机会。
+    """
+    active_rule_version: str = "v2"   # 本次上线生效的规则版本；回滚后为 v1
+    rolled_back: bool = False
+    receipts: dict[tuple[str, str], FingerprintCompatReceipt] = field(default_factory=dict)
+    confirmations: dict[tuple[str, str], ExecutionConfirmation] = field(default_factory=dict)
+
+    def receipt_for(self, source_channel: str, legacy_hash: str) -> FingerprintCompatReceipt | None:
+        return self.receipts.get((source_channel, legacy_hash))
+
+    def confirmation_for(self, source_channel: str, legacy_hash: str) -> ExecutionConfirmation | None:
+        return self.confirmations.get((source_channel, legacy_hash))
+
+    def execution_count(self) -> int:
+        """已确认的执行机会总数（重放不计入）。"""
+        return len(self.confirmations)
 
 
 @dataclass
